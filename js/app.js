@@ -140,12 +140,14 @@ let state = {
   isPlaying: false,
   showPinyin: false,
   showTranslation: false,
-  speechRate: 0.82      // faixa útil: 0.55 ~ 1.25
+  speechRate: 0.85,     // velocidade da voz
+  syncFactor: 1.00      // ajuste fino do destaque (0.70 ~ 1.40)
 };
 
 let synth = window.speechSynthesis;
 let currentUtterance = null;
-let highlightInterval = null;
+let highlightRAF = null;
+let speakStartTime = 0;
 
 // ---------- Persistência ----------
 function loadState() {
@@ -155,7 +157,10 @@ function loadState() {
       const saved = JSON.parse(raw);
       state.mastery = saved.mastery || {};
       if (typeof saved.speechRate === 'number') {
-        state.speechRate = Math.min(1.25, Math.max(0.55, saved.speechRate));
+        state.speechRate = Math.min(1.30, Math.max(0.50, saved.speechRate));
+      }
+      if (typeof saved.syncFactor === 'number') {
+        state.syncFactor = Math.min(1.40, Math.max(0.70, saved.syncFactor));
       }
     }
   } catch (e) {
@@ -172,7 +177,8 @@ function loadState() {
 function saveState() {
   const toSave = {
     mastery: {},
-    speechRate: state.speechRate
+    speechRate: state.speechRate,
+    syncFactor: state.syncFactor
   };
   state.sentences.forEach(s => {
     toSave.mastery[s.id] = s.mastery;
@@ -204,14 +210,14 @@ function setMastery(id, level) {
 // ---------- TTS + Highlight ----------
 function stopSpeaking() {
   if (synth.speaking) synth.cancel();
-  if (highlightInterval) {
-    clearInterval(highlightInterval);
-    highlightInterval = null;
+  if (highlightRAF) {
+    cancelAnimationFrame(highlightRAF);
+    highlightRAF = null;
   }
   state.isPlaying = false;
   currentUtterance = null;
+  speakStartTime = 0;
 
-  // Remove highlights
   document.querySelectorAll('.hanzi-display .char').forEach(c => {
     c.classList.remove('active', 'spoken');
   });
@@ -241,78 +247,65 @@ function speakSentence(sentence) {
     `<span class="char" data-i="${i}">${ch}</span>`
   ).join('');
 
+  const totalChars = chars.length;
+
+  // Estimativa de duração total (em segundos)
+  // ~0.32s por caractere em rate 1.0 para a maioria das vozes zh-CN
+  const estimatedDuration = (totalChars * 0.32) / state.speechRate;
+
   const utterance = new SpeechSynthesisUtterance(sentence.hanzi);
   utterance.lang = 'zh-CN';
   utterance.rate = state.speechRate;
   utterance.pitch = 1;
 
-  // Tenta usar voz chinesa se disponível
   const voices = synth.getVoices();
   const zhVoice = voices.find(v => v.lang.startsWith('zh') || v.lang.includes('Chinese'));
   if (zhVoice) utterance.voice = zhVoice;
 
-  let currentIndex = 0;
-  const totalChars = chars.length;
-  let usedBoundary = false; // se o navegador fornecer eventos de fronteira
+  function highlightAt(progress) {
+    // progress: 0 → 1
+    // syncFactor > 1 = destaque mais rápido; < 1 = mais lento
+    const adjusted = Math.min(1, Math.max(0, progress * state.syncFactor));
+    const index = Math.floor(adjusted * totalChars);
 
-  // --- Timing estimado (fallback) ---
-  // Calibrado empiricamente para vozes zh-CN em rate ~0.8–0.9
-  // Fórmula: tempo médio por caractere ≈ 280ms / rate
-  const msPerChar = Math.round(280 / state.speechRate);
-  const initialDelay = Math.round(120 / state.speechRate);
-
-  function highlightChar(index) {
     document.querySelectorAll('.hanzi-display .char').forEach((el, idx) => {
       el.classList.remove('active');
-      if (idx < index) el.classList.add('spoken');
-      else el.classList.remove('spoken');
+      if (idx < index) {
+        el.classList.add('spoken');
+      } else {
+        el.classList.remove('spoken');
+      }
     });
+
     if (index < totalChars) {
       const el = document.querySelector(`.hanzi-display .char[data-i="${index}"]`);
       if (el) el.classList.add('active');
     }
   }
 
-  // Tenta usar onboundary (funciona em alguns Chrome + vozes)
-  utterance.onboundary = (event) => {
-    if (event.name === 'word' || event.name === 'sentence') {
-      usedBoundary = true;
-      // event.charIndex aponta para o início da palavra atual
-      // Avançamos o highlight até esse ponto
-      const target = Math.min(event.charIndex, totalChars - 1);
-      if (target >= currentIndex) {
-        currentIndex = target;
-        highlightChar(currentIndex);
-      }
-    }
-  };
-
   utterance.onstart = () => {
     state.isPlaying = true;
     updatePlayButton(true);
+    speakStartTime = performance.now();
 
-    // Fallback por tempo (sempre inicia; se boundary funcionar, ele sobrescreve)
-    setTimeout(() => {
-      if (usedBoundary) return; // se já estiver recebendo boundary, não usa o timer
+    const tick = () => {
+      if (!state.isPlaying) return;
 
-      highlightInterval = setInterval(() => {
-        if (usedBoundary) {
-          clearInterval(highlightInterval);
-          return;
-        }
-        highlightChar(currentIndex);
-        currentIndex++;
-        if (currentIndex >= totalChars) {
-          clearInterval(highlightInterval);
-        }
-      }, msPerChar);
-    }, initialDelay);
+      const elapsed = (performance.now() - speakStartTime) / 1000; // segundos
+      const progress = elapsed / estimatedDuration;
+      highlightAt(progress);
+
+      if (progress < 1.05) {
+        highlightRAF = requestAnimationFrame(tick);
+      }
+    };
+    highlightRAF = requestAnimationFrame(tick);
   };
 
   utterance.onend = () => {
     stopSpeaking();
     updatePlayButton(false);
-    // Marca todos como spoken no final
+    // Garante que tudo fique marcado no final
     document.querySelectorAll('.hanzi-display .char').forEach(c => {
       c.classList.add('spoken');
       c.classList.remove('active');
@@ -414,10 +407,21 @@ function renderDetail(container) {
 
       <div class="speed-control">
         <div class="speed-label">
-          <span>Velocidade</span>
+          <span>Velocidade da voz</span>
           <span id="speedValue">${state.speechRate.toFixed(2)}x</span>
         </div>
         <input type="range" id="speedSlider" min="0.55" max="1.25" step="0.01" value="${state.speechRate}" />
+      </div>
+
+      <div class="speed-control" style="margin-top:8px">
+        <div class="speed-label">
+          <span>Ajuste do destaque</span>
+          <span id="syncValue">${state.syncFactor.toFixed(2)}</span>
+        </div>
+        <input type="range" id="syncSlider" min="0.70" max="1.40" step="0.01" value="${state.syncFactor}" />
+        <div style="font-size:0.72rem;color:var(--muted);margin-top:6px">
+          ← mais lento &nbsp;&nbsp;|&nbsp;&nbsp; mais rápido →
+        </div>
       </div>
 
       <div class="reveal-row">
@@ -466,13 +470,23 @@ function renderDetail(container) {
     updatePlayButton(false);
   });
 
-  // Controle de velocidade
-  const slider = document.getElementById('speedSlider');
+  // Controle de velocidade da voz
+  const speedSlider = document.getElementById('speedSlider');
   const speedValue = document.getElementById('speedValue');
-  slider.addEventListener('input', () => {
-    const val = parseFloat(slider.value);
+  speedSlider.addEventListener('input', () => {
+    const val = parseFloat(speedSlider.value);
     state.speechRate = val;
     speedValue.textContent = val.toFixed(2) + 'x';
+    saveState();
+  });
+
+  // Ajuste fino do destaque (só o texto, não a voz)
+  const syncSlider = document.getElementById('syncSlider');
+  const syncValue = document.getElementById('syncValue');
+  syncSlider.addEventListener('input', () => {
+    const val = parseFloat(syncSlider.value);
+    state.syncFactor = val;
+    syncValue.textContent = val.toFixed(2);
     saveState();
   });
 
