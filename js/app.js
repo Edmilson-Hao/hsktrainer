@@ -140,7 +140,7 @@ let state = {
   isPlaying: false,
   showPinyin: false,
   showTranslation: false,
-  speechRate: 0.75      // 0.5 ~ 1.4
+  speechRate: 0.82      // faixa útil: 0.55 ~ 1.25
 };
 
 let synth = window.speechSynthesis;
@@ -155,7 +155,7 @@ function loadState() {
       const saved = JSON.parse(raw);
       state.mastery = saved.mastery || {};
       if (typeof saved.speechRate === 'number') {
-        state.speechRate = Math.min(1.4, Math.max(0.5, saved.speechRate));
+        state.speechRate = Math.min(1.25, Math.max(0.55, saved.speechRate));
       }
     }
   } catch (e) {
@@ -232,7 +232,7 @@ function speakSentence(sentence) {
     return;
   }
 
-  const chars = [...sentence.hanzi]; // array de caracteres
+  const chars = [...sentence.hanzi];
   const display = document.getElementById('hanziDisplay');
   if (!display) return;
 
@@ -253,32 +253,56 @@ function speakSentence(sentence) {
 
   let currentIndex = 0;
   const totalChars = chars.length;
+  let usedBoundary = false; // se o navegador fornecer eventos de fronteira
 
-  // Base ~310ms em rate 0.75 → escala inversamente com a velocidade
-  // rate 0.5 → mais lento (~465ms), rate 1.2 → mais rápido (~194ms)
-  const baseMs = 310;
-  const baseRate = 0.75;
-  const msPerChar = Math.round(baseMs * (baseRate / state.speechRate));
+  // --- Timing estimado (fallback) ---
+  // Calibrado empiricamente para vozes zh-CN em rate ~0.8–0.9
+  // Fórmula: tempo médio por caractere ≈ 280ms / rate
+  const msPerChar = Math.round(280 / state.speechRate);
+  const initialDelay = Math.round(120 / state.speechRate);
+
+  function highlightChar(index) {
+    document.querySelectorAll('.hanzi-display .char').forEach((el, idx) => {
+      el.classList.remove('active');
+      if (idx < index) el.classList.add('spoken');
+      else el.classList.remove('spoken');
+    });
+    if (index < totalChars) {
+      const el = document.querySelector(`.hanzi-display .char[data-i="${index}"]`);
+      if (el) el.classList.add('active');
+    }
+  }
+
+  // Tenta usar onboundary (funciona em alguns Chrome + vozes)
+  utterance.onboundary = (event) => {
+    if (event.name === 'word' || event.name === 'sentence') {
+      usedBoundary = true;
+      // event.charIndex aponta para o início da palavra atual
+      // Avançamos o highlight até esse ponto
+      const target = Math.min(event.charIndex, totalChars - 1);
+      if (target >= currentIndex) {
+        currentIndex = target;
+        highlightChar(currentIndex);
+      }
+    }
+  };
 
   utterance.onstart = () => {
     state.isPlaying = true;
     updatePlayButton(true);
 
-    // Pequeno atraso inicial para sincronizar melhor com o início da fala
-    const initialDelay = Math.round(180 * (baseRate / state.speechRate));
+    // Fallback por tempo (sempre inicia; se boundary funcionar, ele sobrescreve)
     setTimeout(() => {
-      highlightInterval = setInterval(() => {
-        // Marca os anteriores como spoken
-        document.querySelectorAll('.hanzi-display .char').forEach((el, idx) => {
-          el.classList.remove('active');
-          if (idx < currentIndex) el.classList.add('spoken');
-        });
+      if (usedBoundary) return; // se já estiver recebendo boundary, não usa o timer
 
-        if (currentIndex < totalChars) {
-          const el = document.querySelector(`.hanzi-display .char[data-i="${currentIndex}"]`);
-          if (el) el.classList.add('active');
-          currentIndex++;
-        } else {
+      highlightInterval = setInterval(() => {
+        if (usedBoundary) {
+          clearInterval(highlightInterval);
+          return;
+        }
+        highlightChar(currentIndex);
+        currentIndex++;
+        if (currentIndex >= totalChars) {
           clearInterval(highlightInterval);
         }
       }, msPerChar);
@@ -393,7 +417,7 @@ function renderDetail(container) {
           <span>Velocidade</span>
           <span id="speedValue">${state.speechRate.toFixed(2)}x</span>
         </div>
-        <input type="range" id="speedSlider" min="0.5" max="1.4" step="0.05" value="${state.speechRate}" />
+        <input type="range" id="speedSlider" min="0.55" max="1.25" step="0.01" value="${state.speechRate}" />
       </div>
 
       <div class="reveal-row">
